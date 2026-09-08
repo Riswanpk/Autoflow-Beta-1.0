@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Water Can WhatsApp + Decentro Demo
 
 Beginner-friendly demo: WhatsApp Cloud API -> booking template -> checkout -> Decentro UPI payment link -> Decentro callback -> optional payout -> WhatsApp confirmation -> admin.
@@ -54,3 +55,6 @@ Open https://YOUR-DOMAIN/admin. Browser basic auth defaults to admin/demo123. Ch
 6. Optional payout runs.
 7. WhatsApp confirmation is sent.
 8. Admin page shows the order.
+=======
+# Autoflow-Beta-1.0
+>>>>>>> 37975e9035b71c37f8fde467ce7ea70441881740
