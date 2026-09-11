@@ -44,13 +44,39 @@ async function waSend(payload) {
   return axios.post(url, payload, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type':'application/json' } });
 }
 
-async function sendBookingTemplate(phone, ref) {
-  // Create a WhatsApp template in Meta with a URL button:
-  // https://YOUR-DOMAIN/checkout?ref={{1}}
+async function sendBookingTemplate(phone, ref, name) {
   return waSend({
-    messaging_product:'whatsapp', to:phone, type:'template',
-    template:{ name:process.env.WA_BOOK_TEMPLATE_NAME, language:{code:process.env.WA_TEMPLATE_LANG || 'en_US'},
-      components:[{ type:'button', sub_type:'url', index:'0', parameters:[{type:'text', text:ref}] }] }
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'template',
+    template: {
+      name: process.env.WA_BOOK_TEMPLATE_NAME,
+      language: {
+        code: process.env.WA_TEMPLATE_LANG || 'en_US'
+      },
+      components: [
+        {
+          type: 'body',
+          parameters: [
+            {
+              type: 'text',
+              text: name || 'Customer'
+            }
+          ]
+        },
+        {
+          type: 'button',
+          sub_type: 'url',
+          index: '0',
+          parameters: [
+            {
+              type: 'text',
+              text: ref
+            }
+          ]
+        }
+      ]
+    }
   });
 }
 
@@ -83,7 +109,7 @@ app.post('/webhook', async (req,res)=>{
     const name=value?.contacts?.[0]?.profile?.name || 'Customer';
     const ref=nanoid(10);
     db.prepare(`INSERT INTO orders(id,phone,name,payment_status) VALUES(?,?,?,?)`).run(ref,phone,name,'CHAT_STARTED');
-    await sendBookingTemplate(phone,ref);
+    await sendBookingTemplate(phone, ref, name);
   } catch(e){ console.error('WA webhook error', e.response?.data || e.message); }
 });
 
