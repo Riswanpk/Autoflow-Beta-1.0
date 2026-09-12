@@ -91,6 +91,25 @@ function verifyPayuResponse(data) {
   return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
 }
 
+function mockPayuSplit(orderId, payuId) {
+  const platformPercent=Number(process.env.PAYU_TEST_PLATFORM_PERCENT || 2);
+  const mainPercent=100 - platformPercent;
+  return {
+    status: 1,
+    message: 'Test split created locally. No money was moved.',
+    splitStatus: 'success',
+    test: true,
+    var1: {
+      type: 'percentage',
+      payuId,
+      splitInfo: {
+        TEST_PLATFORM_MERCHANT: { aggregatorSubTxnId: `TEST-PLATFORM-${orderId}`, aggregatorSubAmt: platformPercent.toFixed(2) },
+        TEST_MAIN_MERCHANT: { aggregatorSubTxnId: `TEST-MAIN-${orderId}`, aggregatorSubAmt: mainPercent.toFixed(2) }
+      }
+    }
+  };
+}
+
 async function waSend(payload) {
   const url = `https://graph.facebook.com/${process.env.WA_GRAPH_VERSION || 'v23.0'}/${process.env.WA_PHONE_NUMBER_ID}/messages`;
   return axios.post(url, payload, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type':'application/json' } });
@@ -188,11 +207,14 @@ app.post('/api/order/:id', async (req,res)=>{
 app.post('/api/order/:id/pay', async (req,res)=>{
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   if(!o.total_amount) return res.status(400).json({error:'Complete checkout first'});
-  if (process.env.MOCK_DECENTRO === 'true') {
+  if (process.env.MOCK_PAYU_PAYMENT === 'true' || process.env.MOCK_DECENTRO === 'true') {
     const status=String(process.env.MOCK_DECENTRO_STATUS || 'SUCCESS').toUpperCase();
     const txn=`MOCK-${nanoid(8)}`;
     if (status === 'SUCCESS') {
       db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(txn,o.id);
+      if (process.env.PAYU_MOCK_SPLIT === 'true') {
+        db.prepare(`UPDATE orders SET payout_status='SPLIT_TEST_SUCCESS' WHERE id=?`).run(o.id);
+      }
       return res.json({ok:true,transaction_id:txn,payment_url:`${BASE}/success.html?ref=${encodeURIComponent(o.id)}`,mock:true});
     }
     if (status === 'PENDING') {
@@ -224,11 +246,23 @@ app.post('/api/order/:id/pay', async (req,res)=>{
       udf1:o.id
     };
     if (splitRequest) fields.splitRequest=splitRequest;
+
     fields.hash=payuHash(fields,splitRequest);
     const paymentUrl=`${BASE}/payu/checkout/${encodeURIComponent(o.id)}`;
     db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED',decentro_txn_id=? WHERE id=?`).run(o.id,o.id);
     res.json({ok:true,transaction_id:o.id,payment_url:paymentUrl,provider:'payu'});
   } catch(e){ console.error('PayU payment setup error',e.message); res.status(502).json({error:'PayU configuration error',details:e.message}); }
+});
+
+app.post('/api/order/:id/split', (req,res)=>{
+  const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if(!o) return res.status(404).json({error:'Order not found'});
+  if(o.payment_status!=='PAID') return res.status(400).json({error:'Payment must be successful before splitting'});
+  if(process.env.PAYU_MOCK_SPLIT !== 'true') return res.status(503).json({error:'PayU split is not in test mode'});
+  const payuId=req.body.payuId || `TEST-PAYU-${o.id}`;
+  const result=mockPayuSplit(o.id,payuId);
+  db.prepare(`UPDATE orders SET payout_status='SPLIT_TEST_SUCCESS' WHERE id=?`).run(o.id);
+  res.json({ok:true,provider:'payu',result});
 });
 
 app.get('/payu/checkout/:id',(req,res)=>{
