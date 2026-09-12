@@ -10,6 +10,10 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
+app.get('/checkout', (req, res) => {
+  res.sendFile('index.html', { root: 'public' });
+});
+
 const PORT = process.env.PORT || 3000;
 const BASE = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const db = new Database('orders.db');
