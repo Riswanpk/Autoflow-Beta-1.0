@@ -43,6 +43,16 @@ function pricing(cans) {
   return { base, dfee, pfee, total: money(base + dfee + pfee) };
 }
 
+function getUpiUri(value) {
+  if (typeof value === 'string' && /^(upi|https?):\/\//i.test(value)) return value;
+  if (Array.isArray(value)) return value.map(getUpiUri).find(Boolean) || null;
+  if (value && typeof value === 'object') {
+    return [value.common_uri, value.gpay_uri, value.phonepe_uri, value.paytm_uri]
+      .map(getUpiUri).find(Boolean) || null;
+  }
+  return null;
+}
+
 async function waSend(payload) {
   const url = `https://graph.facebook.com/${process.env.WA_GRAPH_VERSION || 'v23.0'}/${process.env.WA_PHONE_NUMBER_ID}/messages`;
   return axios.post(url, payload, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}`, 'Content-Type':'application/json' } });
@@ -155,7 +165,8 @@ app.post('/api/order/:id/pay', async (req,res)=>{
     const r=await axios.post(`${process.env.DECENTRO_BASE_URL}/v3/payments/upi/link`,payload,{headers});
     const data=r.data;
     db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED',decentro_txn_id=? WHERE id=?`).run(data.decentro_txn_id||null,o.id);
-    res.json({ok:true, transaction_id:data.decentro_txn_id, upi_uris:data.upi_uris, response:data});
+    const paymentUrl=getUpiUri(data.upi_uris);
+    res.json({ok:true, transaction_id:data.decentro_txn_id, payment_url:paymentUrl, upi_uris:{common_uri:paymentUrl}, response:data});
   } catch(e){ console.error('Decentro collect error',e.response?.data||e.message); res.status(502).json({error:'Decentro error',details:e.response?.data||e.message}); }
 });
 
