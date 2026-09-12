@@ -26,11 +26,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
   cans INTEGER,
   address TEXT,
   base_amount REAL,
-  decentro_fee REAL,
   platform_fee REAL,
   total_amount REAL,
   payment_status TEXT DEFAULT 'CREATED',
-  decentro_txn_id TEXT,
   payout_status TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   paid_at TEXT
@@ -39,29 +37,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
 const money = n => Math.round(Number(n) * 100) / 100;
 function pricing(cans) {
   const base = money(cans * Number(process.env.CAN_PRICE || 50));
-  const dfee = money(Number(process.env.DECENTRO_FEE || 3));
   const pfee = money(base * Number(process.env.PLATFORM_FEE_PERCENT || 2) / 100);
-  // Fees are settlement deductions; the customer pays only the order amount.
-  return { base, dfee, pfee, total: base };
-}
-
-function getUpiUri(value) {
-  if (typeof value === 'string' && /^(upi|https?):\/\//i.test(value)) return value;
-  if (Array.isArray(value)) return value.map(getUpiUri).find(Boolean) || null;
-  if (value && typeof value === 'object') {
-    return [value.common_uri, value.gpay_uri, value.phonepe_uri, value.paytm_uri]
-      .map(getUpiUri).find(Boolean) || null;
-  }
-  return null;
-}
-
-function validateDecentroConfig() {
-  const required = ['DECENTRO_BASE_URL', 'DECENTRO_CLIENT_ID', 'DECENTRO_CLIENT_SECRET', 'DECENTRO_CONSUMER_URN'];
-  const missing = required.filter(name => !process.env[name]?.trim());
-  if (missing.length) return `Missing Decentro configuration: ${missing.join(', ')}`;
-  try { new URL(process.env.DECENTRO_BASE_URL); }
-  catch { return 'DECENTRO_BASE_URL must be a valid HTTPS URL'; }
-  return null;
+  return { base, pfee, total: base };
 }
 
 function payuHash(fields, splitRequest = '') {
@@ -199,29 +176,29 @@ app.post('/api/order/:id', async (req,res)=>{
   if(!address || address.trim().length<8) return res.status(400).json({error:'Please enter a delivery address'});
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   const p=pricing(qty);
-  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,decentro_fee=?,platform_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,p.dfee,p.pfee,p.total,req.params.id);
+  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,platform_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,p.pfee,p.total,req.params.id);
   res.json({id:req.params.id,pricing:p});
 });
 
-// Decentro payment-link creation
 app.post('/api/order/:id/pay', async (req,res)=>{
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   if(!o.total_amount) return res.status(400).json({error:'Complete checkout first'});
-  if (process.env.MOCK_PAYU_PAYMENT === 'true' || process.env.MOCK_DECENTRO === 'true') {
-    const status=String(process.env.MOCK_DECENTRO_STATUS || 'SUCCESS').toUpperCase();
+  if (process.env.MOCK_PAYU_PAYMENT === 'true') {
+    const status=String(process.env.MOCK_PAYU_STATUS || 'SUCCESS').toUpperCase();
     const txn=`MOCK-${nanoid(8)}`;
     if (status === 'SUCCESS') {
-      db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(txn,o.id);
+      db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(o.id);
       if (process.env.PAYU_MOCK_SPLIT === 'true') {
         db.prepare(`UPDATE orders SET payout_status='SPLIT_TEST_SUCCESS' WHERE id=?`).run(o.id);
       }
-      return res.json({ok:true,transaction_id:txn,payment_url:`${BASE}/success.html?ref=${encodeURIComponent(o.id)}`,mock:true});
+      const paymentUrl=`${BASE}/success.html?ref=${encodeURIComponent(o.id)}`;
+      return res.json({ok:true,transaction_id:txn,payment_url:paymentUrl,mock:true});
     }
     if (status === 'PENDING') {
-      db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED',decentro_txn_id=? WHERE id=?`).run(txn,o.id);
+      db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED' WHERE id=?`).run(o.id);
       return res.status(202).json({ok:false,mock:true,error:'Mock payment is pending',transaction_id:txn});
     }
-    db.prepare(`UPDATE orders SET payment_status='FAILED',decentro_txn_id=? WHERE id=?`).run(txn,o.id);
+    db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(o.id);
     return res.status(402).json({ok:false,mock:true,error:'Mock payment failed',transaction_id:txn});
   }
   const configError=payuConfigError();
@@ -249,7 +226,7 @@ app.post('/api/order/:id/pay', async (req,res)=>{
 
     fields.hash=payuHash(fields,splitRequest);
     const paymentUrl=`${BASE}/payu/checkout/${encodeURIComponent(o.id)}`;
-    db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED',decentro_txn_id=? WHERE id=?`).run(o.id,o.id);
+    db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED' WHERE id=?`).run(o.id);
     res.json({ok:true,transaction_id:o.id,payment_url:paymentUrl,provider:'payu'});
   } catch(e){ console.error('PayU payment setup error',e.message); res.status(502).json({error:'PayU configuration error',details:e.message}); }
 });
@@ -280,7 +257,7 @@ app.get('/payu/checkout/:id',(req,res)=>{
 app.post('/payu/success',(req,res)=>{
   const id=req.body.txnid; const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if(!o || String(req.body.status).toLowerCase()!=='success' || !verifyPayuResponse(req.body)) return res.status(400).send('Invalid PayU payment response');
-  db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(req.body.mihpayid||id,id);
+  db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(id);
   res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
 });
 
@@ -289,48 +266,6 @@ app.post('/payu/failure',(req,res)=>{
   if(id) db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
   res.status(402).send('PayU payment failed. Please return to checkout and try again.');
 });
-
-// Decentro callback. Configure this exact URL in Decentro: /webhooks/decentro/payment
-app.post('/webhooks/decentro/payment', async (req,res)=>{
-  res.sendStatus(200);
-  try{
-    console.log('Decentro callback:',JSON.stringify(req.body));
-    const b=req.body;
-    const id=b.reference_id || b.referenceId || b.client_reference_id;
-    const txn=b.decentro_txn_id || b.decentroTxnId;
-    const status=String(b.transaction_status || b.transactionStatus || b.status || '').toUpperCase();
-    if(!id) return;
-    const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id); if(!o) return;
-    if(status==='SUCCESS' || status==='SUCCEEDED'){
-      db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(txn||o.decentro_txn_id,id);
-      // Optional payout. See README: collection settlement/split is preferable if Decentro configures it.
-      if(process.env.DECENTRO_MASTER_VIRTUAL_ACCOUNT && process.env.DECENTRO_SECOND_UPI){
-        const payoutAmount=money(o.platform_fee||0);
-        try { const pr=await initiatePayout({order:o,amount:payoutAmount});
-          db.prepare(`UPDATE orders SET payout_status=? WHERE id=?`).run(pr.transactionStatus||pr.status||'INITIATED',id);
-        } catch(e){ console.error('Payout error',e.response?.data||e.message); db.prepare(`UPDATE orders SET payout_status='FAILED' WHERE id=?`).run(id); }
-      }
-      await sendConfirmation(o.phone,{...o,payment_status:'PAID'});
-    } else if(status==='FAILED' || status==='FAILURE') {
-      db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
-    }
-  }catch(e){ console.error('callback error',e.message); }
-});
-
-async function initiatePayout({order,amount}){
-  const payload={
-    reference_id:`PO${order.id}`.slice(0,11),
-    purpose_message:'WaterCan partner payout',
-    from_account:process.env.DECENTRO_MASTER_VIRTUAL_ACCOUNT,
-    transfer_type:'UPI',
-    to_upi:process.env.DECENTRO_SECOND_UPI,
-    transfer_amount:amount,
-    beneficiary_details:{payee_name:process.env.DECENTRO_SECOND_PAYEE_NAME||'Partner'}
-  };
-  const headers={client_id:process.env.DECENTRO_CLIENT_ID,client_secret:process.env.DECENTRO_CLIENT_SECRET,module_secret:process.env.DECENTRO_MODULE_SECRET,provider_secret:process.env.DECENTRO_PROVIDER_SECRET};
-  const r=await axios.post('https://in.staging.decentro.tech/core_banking/money_transfer/initiate',payload,{headers});
-  return r.data;
-}
 
 app.get('/admin',authAdmin,(req,res)=>{
   const rows=db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();

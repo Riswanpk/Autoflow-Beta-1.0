@@ -25,20 +25,16 @@ The code sends the order reference as the dynamic suffix.
 
 If Meta template approval is not ready, temporarily change the webhook to send a normal text containing https://YOUR-DOMAIN/checkout?ref=ORDERID for testing.
 
-## 3. Decentro
-Use the staging environment. Decentro's payment-link endpoint is https://staging.api.decentro.tech/v3/payments/upi/link. It accepts client_id/client_secret headers and consumer_urn, reference_id, amount, purpose_message, expiry_time and redirect_url in the body. Their testbed uses amount 10 for SUCCESS, 20 for FAILURE, 40 for PENDING, and deliberately delays terminal simulation by about 10 seconds.
+## 3. PayU
+Use PayU hosted checkout with `PAYU_BASE_URL`, `PAYU_KEY`, `PAYU_SALT`, and `PAYU_EMAIL`. Configure these callback URLs in PayU:
 
-Configure Decentro's terminal transaction callback to:
-https://YOUR-DOMAIN/webhooks/decentro/payment
+    https://YOUR-DOMAIN/payu/success
+    https://YOUR-DOMAIN/payu/failure
 
-Important: the sandbox is a simulation. The HTTP/API integration is real, but it does not move real customer money. Do not put production credentials into this demo.
+Set `MOCK_PAYU_PAYMENT=true` for local testing without PayU credentials. Set it to `false` for real PayU test checkout.
 
-For local testing without a Decentro account, set `MOCK_DECENTRO=true`. The checkout marks the order paid and opens the success page without calling Decentro. Set `MOCK_DECENTRO_STATUS` to `SUCCESS`, `FAILED`, or `PENDING` to test each result. Set it back to `false` before using real Decentro.
-
-## 4. Payout
-The optional payout function uses Decentro's staging Direct Payout endpoint and requires module_secret/provider_secret plus a master virtual account. Decentro requires the payout source account to be linked/configured for the provider. Set DECENTRO_MASTER_VIRTUAL_ACCOUNT and DECENTRO_SECOND_UPI to enable it.
-
-For an actual 2% split at collection time, ask Decentro to configure a split-settlement rule and put its URN in DECENTRO_SPLIT_SETTLEMENT_RULE_URN. The collection API supports split_settlement_rule_urn. The customer should pay the base order amount; the split rule must allocate the 2% platform share and Decentro's processing fee from that payment, with the remainder settling to the main account. This is preferable to adding both fees to the customer's amount.
+## 4. Split settlement
+PayU split settlement requires an activated parent merchant account and child merchants. The local `PAYU_MOCK_SPLIT=true` mode uses fake IDs and moves no money. Real split settlement requires PayU-issued child merchant keys and an approved `PAYU_SPLIT_REQUEST`.
 
 ## 5. Deploy on Render/Railway
 Push this folder to GitHub. Create a Web Service using `npm install` as build command and `npm start` as start command. Add all .env values as service environment variables. Set PUBLIC_BASE_URL to the HTTPS service URL.
@@ -52,11 +48,10 @@ Open https://YOUR-DOMAIN/admin. Browser basic auth defaults to admin/demo123. Ch
 1. Send any text to the Meta test WhatsApp number.
 2. Tap Book can now.
 3. Select cans and enter address.
-4. Pay through Decentro staging test flow.
-5. Decentro callback marks order PAID.
-6. Optional payout runs.
-7. WhatsApp confirmation is sent.
-8. Admin page shows the order.
+4. Pay through PayU hosted checkout or local mock mode.
+5. PayU callback marks order PAID.
+6. WhatsApp confirmation is sent.
+7. Admin page shows the order.
 =======
 # Autoflow-Beta-1.0
 >>>>>>> 37975e9035b71c37f8fde467ce7ea70441881740
