@@ -1,7 +1,7 @@
 <<<<<<< HEAD
-# Water Can WhatsApp + Decentro Demo
+# Water Can WhatsApp + PayU Demo
 
-Beginner-friendly demo: WhatsApp Cloud API -> booking template -> checkout -> Decentro UPI payment link -> Decentro callback -> optional payout -> WhatsApp confirmation -> admin.
+Beginner-friendly demo: WhatsApp Cloud API -> booking template -> checkout -> PayU hosted checkout -> PayU callback -> optional split settlement -> WhatsApp confirmation -> admin.
 
 ## 1. Local setup
 Install Node.js 20+. Then:
@@ -33,10 +33,12 @@ https://YOUR-DOMAIN/webhooks/decentro/payment
 
 Important: the sandbox is a simulation. The HTTP/API integration is real, but it does not move real customer money. Do not put production credentials into this demo.
 
+For local testing without a Decentro account, set `MOCK_DECENTRO=true`. The checkout marks the order paid and opens the success page without calling Decentro. Set `MOCK_DECENTRO_STATUS` to `SUCCESS`, `FAILED`, or `PENDING` to test each result. Set it back to `false` before using real Decentro.
+
 ## 4. Payout
 The optional payout function uses Decentro's staging Direct Payout endpoint and requires module_secret/provider_secret plus a master virtual account. Decentro requires the payout source account to be linked/configured for the provider. Set DECENTRO_MASTER_VIRTUAL_ACCOUNT and DECENTRO_SECOND_UPI to enable it.
 
-For an actual 2% split at collection time, ask Decentro to configure a split-settlement rule and put its URN in DECENTRO_SPLIT_SETTLEMENT_RULE_URN. The collection API supports split_settlement_rule_urn. This is preferable to inventing a post-settlement accounting flow.
+For an actual 2% split at collection time, ask Decentro to configure a split-settlement rule and put its URN in DECENTRO_SPLIT_SETTLEMENT_RULE_URN. The collection API supports split_settlement_rule_urn. The customer should pay the base order amount; the split rule must allocate the 2% platform share and Decentro's processing fee from that payment, with the remainder settling to the main account. This is preferable to adding both fees to the customer's amount.
 
 ## 5. Deploy on Render/Railway
 Push this folder to GitHub. Create a Web Service using `npm install` as build command and `npm start` as start command. Add all .env values as service environment variables. Set PUBLIC_BASE_URL to the HTTPS service URL.
