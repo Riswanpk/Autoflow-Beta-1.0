@@ -55,7 +55,7 @@ function pricing(cans) {
 function payuHash(fields, splitRequest = '') {
   const values = ['key', 'txnid', 'amount', 'productinfo', 'firstname', 'email', 'udf1', 'udf2', 'udf3', 'udf4', 'udf5']
     .map(name => fields[name] || '');
-  const hashInput = `${values.join('|')}||||||${process.env.PAYU_SALT}${splitRequest ? `|${splitRequest}` : ''}`;
+  const hashInput = `${values.join('|')}|||||||||||${process.env.PAYU_SALT}${splitRequest ? `|${splitRequest}` : ''}`;
   return crypto.createHash('sha512').update(hashInput).digest('hex');
 }
 
@@ -74,7 +74,8 @@ function verifyPayuResponse(data) {
   if (!data.hash || !process.env.PAYU_SALT) return false;
   const prefix = data.additionalCharges ? `${data.additionalCharges}|` : '';
   const splitInfo = data.splitInfo || data.splitRequest || '';
-  const input = `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitInfo}||||||${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
+  const splitPart = splitInfo ? `${splitInfo}|` : '';
+  const input = `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}|||||||||||${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
   const expected = crypto.createHash('sha512').update(input).digest('hex');
   const received = String(data.hash).toLowerCase();
   return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
@@ -267,7 +268,16 @@ app.get('/payu/checkout/:id',(req,res)=>{
 
 app.post('/payu/success',(req,res)=>{
   const id=req.body.txnid; const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
-  if(!o || req.body.txnid!==o.id || Number(req.body.amount)!==Number(o.total_amount) || String(req.body.status).toLowerCase()!=='success' || !verifyPayuResponse(req.body)) return res.status(400).send('Invalid PayU payment response');
+  const reasons=[];
+  if(!o) reasons.push('order_not_found');
+  if(o && req.body.txnid!==o.id) reasons.push('transaction_mismatch');
+  if(o && Number(req.body.amount)!==Number(o.total_amount)) reasons.push('amount_mismatch');
+  if(String(req.body.status).toLowerCase()!=='success') reasons.push('status_not_success');
+  if(!verifyPayuResponse(req.body)) reasons.push('hash_mismatch');
+  if(reasons.length){
+    console.error('PayU success rejected', JSON.stringify({reasons,txnid:req.body.txnid,status:req.body.status,amount:req.body.amount,udf1:req.body.udf1,keyPresent:Boolean(req.body.key),hashLength:String(req.body.hash||'').length,splitInfoPresent:Boolean(req.body.splitInfo)}));
+    return res.status(400).send('Invalid PayU payment response');
+  }
   db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(id);
   res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
 });
