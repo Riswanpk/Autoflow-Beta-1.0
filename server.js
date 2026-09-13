@@ -1,5 +1,6 @@
 import express from 'express';
 import axios from 'axios';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import dotenv from 'dotenv';
 import { nanoid } from 'nanoid';
@@ -12,6 +13,8 @@ app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3000;
 const BASE = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const PAYU_SUCCESS_URL = process.env.PAYU_SUCCESS_URL || `${BASE}/payu/success`;
+const PAYU_FAILURE_URL = process.env.PAYU_FAILURE_URL || `${BASE}/payu/failure`;
 const db = new Database('orders.db');
 db.pragma('journal_mode = WAL');
 db.exec(`CREATE TABLE IF NOT EXISTS orders (
@@ -23,6 +26,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
   base_amount REAL,
   decentro_fee REAL,
   platform_fee REAL,
+  gateway_fee REAL,
+  gateway_tax REAL,
+  processing_fee REAL,
   total_amount REAL,
   payment_status TEXT DEFAULT 'CREATED',
   decentro_txn_id TEXT,
@@ -30,13 +36,72 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   paid_at TEXT
 )`);
+for (const column of ['gateway_fee', 'gateway_tax', 'processing_fee']) {
+  try { db.exec(`ALTER TABLE orders ADD COLUMN ${column} REAL`); } catch (e) { /* already exists */ }
+}
 
 const money = n => Math.round(Number(n) * 100) / 100;
 function pricing(cans) {
   const base = money(cans * Number(process.env.CAN_PRICE || 50));
-  const dfee = money(Number(process.env.DECENTRO_FEE || 3));
-  const pfee = money(base * Number(process.env.PLATFORM_FEE_PERCENT || 2) / 100);
-  return { base, dfee, pfee, total: money(base + dfee + pfee) };
+  const platformFee = money(base * Number(process.env.PLATFORM_FEE_PERCENT || 2) / 100);
+  const gatewayFee = money(base * Number(process.env.PAYU_FEE_PERCENT || 2) / 100);
+  const gatewayTax = money(gatewayFee * Number(process.env.PAYU_GST_PERCENT || 18) / 100);
+  const processingFee = money(gatewayFee + gatewayTax);
+  return { base, platformFee, gatewayFee, gatewayTax, processingFee, total: money(base + platformFee + processingFee) };
+}
+
+function payuHash(fields) {
+  const hashInput = [
+    process.env.PAYU_KEY,
+    fields.txnid,
+    fields.amount,
+    fields.productinfo,
+    fields.firstname,
+    fields.email,
+    fields.udf1 || '',
+    fields.udf2 || '',
+    fields.udf3 || '',
+    fields.udf4 || '',
+    fields.udf5 || '',
+    ...Array(10).fill(''),
+    process.env.PAYU_SALT
+  ].join('|');
+  return crypto.createHash('sha512').update(hashInput).digest('hex');
+}
+
+function payuReverseHash(body) {
+  const reverseInput = [
+    ...(body.additionalCharges ? [body.additionalCharges] : []),
+    process.env.PAYU_SALT,
+    body.status || '',
+    ...Array(10).fill(''),
+    body.email || '',
+    body.firstname || '',
+    body.productinfo || '',
+    body.amount || '',
+    body.txnid || '',
+    process.env.PAYU_KEY
+  ].join('|');
+  return crypto.createHash('sha512').update(reverseInput).digest('hex');
+}
+
+function safeEqual(left, right) {
+  if (!left || !right || left.length !== right.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(left), Buffer.from(right));
+}
+
+function payuSplitInfo(order) {
+  const configured = process.env.PAYU_SPLIT_INFO_JSON;
+  if (!configured) return null;
+  const replacements = {
+    '{{TOTAL_AMOUNT}}': order.total_amount,
+    '{{BASE_AMOUNT}}': order.base_amount,
+    '{{PLATFORM_FEE}}': order.platform_fee,
+    '{{PROCESSING_FEE}}': order.processing_fee
+  };
+  let json = configured;
+  for (const [token, value] of Object.entries(replacements)) json = json.replaceAll(token, String(value));
+  return JSON.parse(json);
 }
 
 async function waSend(payload) {
@@ -128,74 +193,60 @@ app.post('/api/order/:id', async (req,res)=>{
   if(!address || address.trim().length<8) return res.status(400).json({error:'Please enter a delivery address'});
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   const p=pricing(qty);
-  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,decentro_fee=?,platform_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,p.dfee,p.pfee,p.total,req.params.id);
+  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,decentro_fee=?,platform_fee=?,gateway_fee=?,gateway_tax=?,processing_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,0,p.platformFee,p.gatewayFee,p.gatewayTax,p.processingFee,p.total,req.params.id);
   res.json({id:req.params.id,pricing:p});
 });
 
-// Decentro payment-link creation
+// PayU hosted checkout creation. Configure the exact splitInfo shape supplied by PayU.
 app.post('/api/order/:id/pay', async (req,res)=>{
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   if(!o.total_amount) return res.status(400).json({error:'Complete checkout first'});
   try {
-    const payload={
-      reference_id:o.id,
-      consumer_urn:process.env.DECENTRO_CONSUMER_URN,
-      amount:o.total_amount,
-      purpose_message:`WaterCan ${o.id}`,
-      generate_psp_uri:true,
-      expiry_time:30,
-      redirect_url:`${BASE}/success.html?ref=${encodeURIComponent(o.id)}`
+    if (!process.env.PAYU_KEY || !process.env.PAYU_SALT) return res.status(500).json({error:'PayU is not configured'});
+    const fields={
+      key:process.env.PAYU_KEY,
+      txnid:o.id,
+      amount:o.total_amount.toFixed(2),
+      productinfo:`WaterCan ${o.id}`,
+      firstname:o.name || 'Customer',
+      email:process.env.PAYU_DEFAULT_EMAIL || 'customer@example.com',
+      phone:o.phone || '',
+      udf1:o.id,
+      surl:PAYU_SUCCESS_URL,
+      furl:PAYU_FAILURE_URL,
+      service_provider:'payu_paisa'
     };
-    if(process.env.DECENTRO_SPLIT_SETTLEMENT_RULE_URN) payload.split_settlement_rule_urn=process.env.DECENTRO_SPLIT_SETTLEMENT_RULE_URN;
-    const headers={client_id:process.env.DECENTRO_CLIENT_ID,client_secret:process.env.DECENTRO_CLIENT_SECRET};
-    const r=await axios.post(`${process.env.DECENTRO_BASE_URL}/v3/payments/upi/link`,payload,{headers});
-    const data=r.data;
-    db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED',decentro_txn_id=? WHERE id=?`).run(data.decentro_txn_id||null,o.id);
-    res.json({ok:true, transaction_id:data.decentro_txn_id, upi_uris:data.upi_uris, response:data});
-  } catch(e){ console.error('Decentro collect error',e.response?.data||e.message); res.status(502).json({error:'Decentro error',details:e.response?.data||e.message}); }
+    const splitInfo=payuSplitInfo(o);
+    if (splitInfo) fields.splitInfo=JSON.stringify(splitInfo);
+    fields.hash=payuHash(fields);
+    db.prepare(`UPDATE orders SET payment_status='PAYMENT_INITIATED',decentro_txn_id=? WHERE id=?`).run(fields.txnid,o.id);
+    res.json({ok:true,gatewayUrl:process.env.PAYU_PAYMENT_URL||'https://test.payu.in/_payment',fields});
+  } catch(e){ console.error('PayU setup error',e.message); res.status(500).json({error:'Invalid PayU splitInfo configuration',details:e.message}); }
 });
 
-// Decentro callback. Configure this exact URL in Decentro: /webhooks/decentro/payment
-app.post('/webhooks/decentro/payment', async (req,res)=>{
-  res.sendStatus(200);
+async function handlePayuCallback(req,res){
   try{
-    console.log('Decentro callback:',JSON.stringify(req.body));
+    console.log('PayU callback:',JSON.stringify(req.body));
     const b=req.body;
-    const id=b.reference_id || b.referenceId || b.client_reference_id;
-    const txn=b.decentro_txn_id || b.decentroTxnId;
-    const status=String(b.transaction_status || b.transactionStatus || b.status || '').toUpperCase();
-    if(!id) return;
-    const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id); if(!o) return;
-    if(status==='SUCCESS' || status==='SUCCEEDED'){
-      db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(txn||o.decentro_txn_id,id);
-      // Optional payout. See README: collection settlement/split is preferable if Decentro configures it.
-      if(process.env.DECENTRO_MASTER_VIRTUAL_ACCOUNT && process.env.DECENTRO_SECOND_UPI){
-        const payoutAmount=money(o.base_amount*Number(process.env.PLATFORM_FEE_PERCENT||2)/100);
-        try { const pr=await initiatePayout({order:o,amount:payoutAmount});
-          db.prepare(`UPDATE orders SET payout_status=? WHERE id=?`).run(pr.transactionStatus||pr.status||'INITIATED',id);
-        } catch(e){ console.error('Payout error',e.response?.data||e.message); db.prepare(`UPDATE orders SET payout_status='FAILED' WHERE id=?`).run(id); }
-      }
+    const id=b.udf1 || b.txnid;
+    const status=String(b.status || '').toLowerCase();
+    if(!id) return res.status(400).send('Missing PayU transaction reference');
+    const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id); if(!o) return res.status(404).send('Order not found');
+    if (b.txnid !== o.id || Number(b.amount) !== Number(o.total_amount) || !safeEqual(String(b.hash || '').toLowerCase(), payuReverseHash(b))) {
+      return res.status(400).send('Invalid PayU payment response');
+    }
+    if(status==='success'){
+      db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(b.mihpayid||b.txnid,id);
       await sendConfirmation(o.phone,{...o,payment_status:'PAID'});
-    } else if(status==='FAILED' || status==='FAILURE') {
+    } else {
       db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
     }
-  }catch(e){ console.error('callback error',e.message); }
-});
-
-async function initiatePayout({order,amount}){
-  const payload={
-    reference_id:`PO${order.id}`.slice(0,11),
-    purpose_message:'WaterCan partner payout',
-    from_account:process.env.DECENTRO_MASTER_VIRTUAL_ACCOUNT,
-    transfer_type:'UPI',
-    to_upi:process.env.DECENTRO_SECOND_UPI,
-    transfer_amount:amount,
-    beneficiary_details:{payee_name:process.env.DECENTRO_SECOND_PAYEE_NAME||'Partner'}
-  };
-  const headers={client_id:process.env.DECENTRO_CLIENT_ID,client_secret:process.env.DECENTRO_CLIENT_SECRET,module_secret:process.env.DECENTRO_MODULE_SECRET,provider_secret:process.env.DECENTRO_PROVIDER_SECRET};
-  const r=await axios.post('https://in.staging.decentro.tech/core_banking/money_transfer/initiate',payload,{headers});
-  return r.data;
+    return res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
+  }catch(e){ console.error('PayU callback error',e.message); return res.status(500).send('PayU callback error'); }
 }
+
+app.all('/payu/success', handlePayuCallback);
+app.all('/payu/failure', handlePayuCallback);
 
 app.get('/admin',authAdmin,(req,res)=>{
   const rows=db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
