@@ -55,7 +55,7 @@ function pricing(cans) {
 function payuHash(fields, splitRequest = '') {
   const values = ['key', 'txnid', 'amount', 'productinfo', 'firstname', 'email', 'udf1', 'udf2', 'udf3', 'udf4', 'udf5']
     .map(name => fields[name] || '');
-  const hashInput = `${values.join('|')}|||||||||||${process.env.PAYU_SALT}${splitRequest ? `|${splitRequest}` : ''}`;
+  const hashInput = `${values.join('|')}||||||${process.env.PAYU_SALT}${splitRequest ? `|${splitRequest}` : ''}`;
   return crypto.createHash('sha512').update(hashInput).digest('hex');
 }
 
