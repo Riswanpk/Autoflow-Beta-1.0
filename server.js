@@ -75,10 +75,16 @@ function verifyPayuResponse(data) {
   const prefix = data.additionalCharges ? `${data.additionalCharges}|` : '';
   const splitInfo = data.splitInfo || data.splitRequest || '';
   const splitPart = splitInfo ? `${splitInfo}|` : '';
-  const input = `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}|||||||||||${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
-  const expected = crypto.createHash('sha512').update(input).digest('hex');
   const received = String(data.hash).toLowerCase();
-  return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
+  const suffix = `${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
+  const inputs = [
+    `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}|||||||||||${suffix}`,
+    `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}||||||${suffix}`
+  ];
+  return inputs.some(input => {
+    const expected = crypto.createHash('sha512').update(input).digest('hex');
+    return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
+  });
 }
 
 function mockPayuSplit(orderId, payuId) {
