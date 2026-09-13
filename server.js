@@ -11,6 +11,10 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
+app.get('/checkout', (req, res) => {
+  res.sendFile('index.html', { root: 'public' });
+});
+
 const PORT = process.env.PORT || 3000;
 const BASE = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const PAYU_SUCCESS_URL = process.env.PAYU_SUCCESS_URL || `${BASE}/payu/success`;
@@ -24,14 +28,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS orders (
   cans INTEGER,
   address TEXT,
   base_amount REAL,
-  decentro_fee REAL,
   platform_fee REAL,
   gateway_fee REAL,
   gateway_tax REAL,
   processing_fee REAL,
   total_amount REAL,
   payment_status TEXT DEFAULT 'CREATED',
-  decentro_txn_id TEXT,
   payout_status TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   paid_at TEXT
@@ -50,58 +52,51 @@ function pricing(cans) {
   return { base, platformFee, gatewayFee, gatewayTax, processingFee, total: money(base + platformFee + processingFee) };
 }
 
-function payuHash(fields) {
-  const hashInput = [
-    process.env.PAYU_KEY,
-    fields.txnid,
-    fields.amount,
-    fields.productinfo,
-    fields.firstname,
-    fields.email,
-    fields.udf1 || '',
-    fields.udf2 || '',
-    fields.udf3 || '',
-    fields.udf4 || '',
-    fields.udf5 || '',
-    ...Array(10).fill(''),
-    process.env.PAYU_SALT
-  ].join('|');
+function payuHash(fields, splitRequest = '') {
+  const values = ['key', 'txnid', 'amount', 'productinfo', 'firstname', 'email', 'udf1', 'udf2', 'udf3', 'udf4', 'udf5']
+    .map(name => fields[name] || '');
+  const hashInput = `${values.join('|')}||||||${process.env.PAYU_SALT}${splitRequest ? `|${splitRequest}` : ''}`;
   return crypto.createHash('sha512').update(hashInput).digest('hex');
 }
 
-function payuReverseHash(body) {
-  const reverseInput = [
-    ...(body.additionalCharges ? [body.additionalCharges] : []),
-    process.env.PAYU_SALT,
-    body.status || '',
-    ...Array(10).fill(''),
-    body.email || '',
-    body.firstname || '',
-    body.productinfo || '',
-    body.amount || '',
-    body.txnid || '',
-    process.env.PAYU_KEY
-  ].join('|');
-  return crypto.createHash('sha512').update(reverseInput).digest('hex');
+function htmlEscape(value) {
+  return String(value).replace(/[&<>"']/g, character => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[character]);
 }
 
-function safeEqual(left, right) {
-  if (!left || !right || left.length !== right.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(left), Buffer.from(right));
+function payuConfigError() {
+  const required = ['PAYU_KEY', 'PAYU_SALT'];
+  const missing = required.filter(name => !process.env[name]?.trim());
+  if (!process.env.PAYU_EMAIL?.trim() && !process.env.PAYU_DEFAULT_EMAIL?.trim()) missing.push('PAYU_EMAIL');
+  return missing.length ? `Missing PayU configuration: ${missing.join(', ')}` : null;
 }
 
-function payuSplitInfo(order) {
-  const configured = process.env.PAYU_SPLIT_INFO_JSON;
-  if (!configured) return null;
-  const replacements = {
-    '{{TOTAL_AMOUNT}}': order.total_amount,
-    '{{BASE_AMOUNT}}': order.base_amount,
-    '{{PLATFORM_FEE}}': order.platform_fee,
-    '{{PROCESSING_FEE}}': order.processing_fee
+function verifyPayuResponse(data) {
+  if (!data.hash || !process.env.PAYU_SALT) return false;
+  const prefix = data.additionalCharges ? `${data.additionalCharges}|` : '';
+  const splitInfo = data.splitInfo || data.splitRequest || '';
+  const input = `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitInfo}||||||${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
+  const expected = crypto.createHash('sha512').update(input).digest('hex');
+  const received = String(data.hash).toLowerCase();
+  return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
+}
+
+function mockPayuSplit(orderId, payuId) {
+  const platformPercent=Number(process.env.PAYU_TEST_PLATFORM_PERCENT || 2);
+  const mainPercent=100 - platformPercent;
+  return {
+    status: 1,
+    message: 'Test split created locally. No money was moved.',
+    splitStatus: 'success',
+    test: true,
+    var1: {
+      type: 'percentage',
+      payuId,
+      splitInfo: {
+        TEST_PLATFORM_MERCHANT: { aggregatorSubTxnId: `TEST-PLATFORM-${orderId}`, aggregatorSubAmt: platformPercent.toFixed(2) },
+        TEST_MAIN_MERCHANT: { aggregatorSubTxnId: `TEST-MAIN-${orderId}`, aggregatorSubAmt: mainPercent.toFixed(2) }
+      }
+    }
   };
-  let json = configured;
-  for (const [token, value] of Object.entries(replacements)) json = json.replaceAll(token, String(value));
-  return JSON.parse(json);
 }
 
 async function waSend(payload) {
@@ -193,60 +188,95 @@ app.post('/api/order/:id', async (req,res)=>{
   if(!address || address.trim().length<8) return res.status(400).json({error:'Please enter a delivery address'});
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   const p=pricing(qty);
-  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,decentro_fee=?,platform_fee=?,gateway_fee=?,gateway_tax=?,processing_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,0,p.platformFee,p.gatewayFee,p.gatewayTax,p.processingFee,p.total,req.params.id);
+  db.prepare(`UPDATE orders SET cans=?,address=?,base_amount=?,platform_fee=?,gateway_fee=?,gateway_tax=?,processing_fee=?,total_amount=?,payment_status='CHECKOUT_READY' WHERE id=?`).run(qty,address.trim(),p.base,p.platformFee,p.gatewayFee,p.gatewayTax,p.processingFee,p.total,req.params.id);
   res.json({id:req.params.id,pricing:p});
 });
 
-// PayU hosted checkout creation. Configure the exact splitInfo shape supplied by PayU.
 app.post('/api/order/:id/pay', async (req,res)=>{
   const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id); if(!o) return res.status(404).json({error:'Order not found'});
   if(!o.total_amount) return res.status(400).json({error:'Complete checkout first'});
+  if (process.env.MOCK_PAYU_PAYMENT === 'true') {
+    const status=String(process.env.MOCK_PAYU_STATUS || 'SUCCESS').toUpperCase();
+    const txn=`MOCK-${nanoid(8)}`;
+    if (status === 'SUCCESS') {
+      db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(o.id);
+      if (process.env.PAYU_MOCK_SPLIT === 'true') {
+        db.prepare(`UPDATE orders SET payout_status='SPLIT_TEST_SUCCESS' WHERE id=?`).run(o.id);
+      }
+      const paymentUrl=`${BASE}/success.html?ref=${encodeURIComponent(o.id)}`;
+      return res.json({ok:true,transaction_id:txn,payment_url:paymentUrl,mock:true});
+    }
+    if (status === 'PENDING') {
+      db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED' WHERE id=?`).run(o.id);
+      return res.status(202).json({ok:false,mock:true,error:'Mock payment is pending',transaction_id:txn});
+    }
+    db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(o.id);
+    return res.status(402).json({ok:false,mock:true,error:'Mock payment failed',transaction_id:txn});
+  }
+  const configError=payuConfigError();
+  if(configError) return res.status(503).json({error:configError});
   try {
-    if (!process.env.PAYU_KEY || !process.env.PAYU_SALT) return res.status(500).json({error:'PayU is not configured'});
+    const splitRequest=process.env.PAYU_SPLIT_REQUEST?.trim() || '';
+    if (splitRequest) JSON.parse(splitRequest);
     const fields={
       key:process.env.PAYU_KEY,
       txnid:o.id,
       amount:o.total_amount.toFixed(2),
       productinfo:`WaterCan ${o.id}`,
       firstname:o.name || 'Customer',
-      email:process.env.PAYU_DEFAULT_EMAIL || 'customer@example.com',
+      email:process.env.PAYU_EMAIL || process.env.PAYU_DEFAULT_EMAIL,
       phone:o.phone || '',
-      udf1:o.id,
+      api_version:splitRequest ? '7' : undefined,
+      pg:'',
+      bankcode:'',
       surl:PAYU_SUCCESS_URL,
       furl:PAYU_FAILURE_URL,
-      service_provider:'payu_paisa'
+      udf1:o.id
     };
-    const splitInfo=payuSplitInfo(o);
-    if (splitInfo) fields.splitInfo=JSON.stringify(splitInfo);
-    fields.hash=payuHash(fields);
-    db.prepare(`UPDATE orders SET payment_status='PAYMENT_INITIATED',decentro_txn_id=? WHERE id=?`).run(fields.txnid,o.id);
-    res.json({ok:true,gatewayUrl:process.env.PAYU_PAYMENT_URL||'https://test.payu.in/_payment',fields});
-  } catch(e){ console.error('PayU setup error',e.message); res.status(500).json({error:'Invalid PayU splitInfo configuration',details:e.message}); }
+    if (splitRequest) fields.splitRequest=splitRequest;
+
+    fields.hash=payuHash(fields,splitRequest);
+    const paymentUrl=`${BASE}/payu/checkout/${encodeURIComponent(o.id)}`;
+    db.prepare(`UPDATE orders SET payment_status='PAYMENT_LINK_CREATED' WHERE id=?`).run(o.id);
+    res.json({ok:true,transaction_id:o.id,payment_url:paymentUrl,provider:'payu'});
+  } catch(e){ console.error('PayU payment setup error',e.message); res.status(502).json({error:'PayU configuration error',details:e.message}); }
 });
 
-async function handlePayuCallback(req,res){
-  try{
-    console.log('PayU callback:',JSON.stringify(req.body));
-    const b=req.body;
-    const id=b.udf1 || b.txnid;
-    const status=String(b.status || '').toLowerCase();
-    if(!id) return res.status(400).send('Missing PayU transaction reference');
-    const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id); if(!o) return res.status(404).send('Order not found');
-    if (b.txnid !== o.id || Number(b.amount) !== Number(o.total_amount) || !safeEqual(String(b.hash || '').toLowerCase(), payuReverseHash(b))) {
-      return res.status(400).send('Invalid PayU payment response');
-    }
-    if(status==='success'){
-      db.prepare(`UPDATE orders SET payment_status='PAID',decentro_txn_id=?,paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(b.mihpayid||b.txnid,id);
-      await sendConfirmation(o.phone,{...o,payment_status:'PAID'});
-    } else {
-      db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
-    }
-    return res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
-  }catch(e){ console.error('PayU callback error',e.message); return res.status(500).send('PayU callback error'); }
-}
+app.post('/api/order/:id/split', (req,res)=>{
+  const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if(!o) return res.status(404).json({error:'Order not found'});
+  if(o.payment_status!=='PAID') return res.status(400).json({error:'Payment must be successful before splitting'});
+  if(process.env.PAYU_MOCK_SPLIT !== 'true') return res.status(503).json({error:'PayU split is not in test mode'});
+  const payuId=req.body.payuId || `TEST-PAYU-${o.id}`;
+  const result=mockPayuSplit(o.id,payuId);
+  db.prepare(`UPDATE orders SET payout_status='SPLIT_TEST_SUCCESS' WHERE id=?`).run(o.id);
+  res.json({ok:true,provider:'payu',result});
+});
 
-app.all('/payu/success', handlePayuCallback);
-app.all('/payu/failure', handlePayuCallback);
+app.get('/payu/checkout/:id',(req,res)=>{
+  const o=db.prepare('SELECT * FROM orders WHERE id=?').get(req.params.id);
+  if(!o || !o.total_amount) return res.status(404).send('Order not found or not ready');
+  const splitRequest=process.env.PAYU_SPLIT_REQUEST?.trim() || '';
+  const fields={key:process.env.PAYU_KEY,txnid:o.id,amount:o.total_amount.toFixed(2),productinfo:`WaterCan ${o.id}`,firstname:o.name||'Customer',email:process.env.PAYU_EMAIL || process.env.PAYU_DEFAULT_EMAIL,phone:o.phone||'',api_version:splitRequest?'7':undefined,pg:'',bankcode:'',surl:PAYU_SUCCESS_URL,furl:PAYU_FAILURE_URL,udf1:o.id};
+  if(splitRequest) fields.splitRequest=splitRequest;
+  fields.hash=payuHash(fields,splitRequest);
+  const action=process.env.PAYU_PAYMENT_URL || process.env.PAYU_BASE_URL || 'https://test.payu.in/_payment';
+  const inputs=Object.entries(fields).filter(([,value])=>value !== undefined && value !== '').map(([name,value])=>`<input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}">`).join('');
+  res.send(`<!doctype html><html><body><p>Redirecting to PayU...</p><form id="payu" method="post" action="${htmlEscape(action)}">${inputs}</form><script>document.getElementById('payu').submit()</script></body></html>`);
+});
+
+app.post('/payu/success',(req,res)=>{
+  const id=req.body.txnid; const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
+  if(!o || req.body.txnid!==o.id || Number(req.body.amount)!==Number(o.total_amount) || String(req.body.status).toLowerCase()!=='success' || !verifyPayuResponse(req.body)) return res.status(400).send('Invalid PayU payment response');
+  db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(id);
+  res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
+});
+
+app.post('/payu/failure',(req,res)=>{
+  const id=req.body.txnid;
+  if(id) db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
+  res.status(402).send('PayU payment failed. Please return to checkout and try again.');
+});
 
 app.get('/admin',authAdmin,(req,res)=>{
   const rows=db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
