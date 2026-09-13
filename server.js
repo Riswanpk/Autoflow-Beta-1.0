@@ -166,6 +166,11 @@ async function sendConfirmation(phone, order) {
   return waSend({ messaging_product:'whatsapp', to:phone, type:'text', text:{body:text} });
 }
 
+async function sendPaymentFailed(phone, order) {
+  const text = `❌ Payment failed\nOrder: ${order.id}\nAmount: ₹${order.total_amount}\nNo amount was confirmed. Please try again or contact support.`;
+  return waSend({ messaging_product:'whatsapp', to:phone, type:'text', text:{body:text} });
+}
+
 function authAdmin(req,res,next){
   const h=req.headers.authorization||'';
   const expected='Basic '+Buffer.from(`${process.env.ADMIN_USER||'admin'}:${process.env.ADMIN_PASSWORD||'demo123'}`).toString('base64');
@@ -286,7 +291,7 @@ app.get('/payu/checkout/:id',(req,res)=>{
   res.send(`<!doctype html><html><body><p>Redirecting to PayU...</p><form id="payu" method="post" action="${htmlEscape(action)}">${inputs}</form><script>document.getElementById('payu').submit()</script></body></html>`);
 });
 
-app.post('/payu/success',(req,res)=>{
+app.post('/payu/success',async (req,res)=>{
   const id=req.body.txnid; const o=db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   const reasons=[];
   if(!o) reasons.push('order_not_found');
@@ -298,14 +303,26 @@ app.post('/payu/success',(req,res)=>{
     console.error('PayU success rejected', JSON.stringify({reasons,txnid:req.body.txnid,status:req.body.status,amount:req.body.amount,udf1:req.body.udf1,keyPresent:Boolean(req.body.key),hashLength:String(req.body.hash||'').length,hashPrefix:String(req.body.hash||'').slice(0,12),additionalChargesPresent:Boolean(req.body.additionalCharges||req.body.additional_charges),splitInfoPresent:Boolean(req.body.splitInfo),candidatePrefixes:payuResponseHashDiagnostics(req.body)}));
     return res.status(400).send('Invalid PayU payment response');
   }
-  db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(id);
+  const wasPaid=o.payment_status==='PAID';
+  db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=COALESCE(paid_at,CURRENT_TIMESTAMP) WHERE id=?`).run(id);
+  if(!wasPaid) {
+    try { await sendConfirmation(o.phone,{...o,payment_status:'PAID'}); }
+    catch(error) { console.error('WhatsApp success message error',error.response?.data||error.message); }
+  }
   res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
 });
 
-app.post('/payu/failure',(req,res)=>{
+app.post('/payu/failure',async (req,res)=>{
   const id=req.body.txnid;
-  if(id) db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
-  res.status(402).send('PayU payment failed. Please return to checkout and try again.');
+  const o=id ? db.prepare('SELECT * FROM orders WHERE id=?').get(id) : null;
+  if(!o) return res.status(404).send('Order not found');
+  const wasFailed=o.payment_status==='FAILED';
+  db.prepare(`UPDATE orders SET payment_status='FAILED' WHERE id=?`).run(id);
+  if(!wasFailed) {
+    try { await sendPaymentFailed(o.phone,o); }
+    catch(error) { console.error('WhatsApp failure message error',error.response?.data||error.message); }
+  }
+  res.redirect(`/success.html?ref=${encodeURIComponent(id)}`);
 });
 
 app.get('/admin',authAdmin,(req,res)=>{

@@ -24,7 +24,7 @@
 			<div><span>Order</span><strong id="order"></strong></div>
 			<div><span>Amount paid</span><strong id="amount"></strong></div>
 		</div>
-		<a id="wa" href="#">Return to WhatsApp</a>
+		<p id="notice" hidden>We have sent the payment update to your WhatsApp number.</p>
 	</main>
 	<script>
 		(async()=>{
@@ -33,7 +33,7 @@
 			const title=document.getElementById('title');
 			const body=document.getElementById('body');
 			const details=document.getElementById('details');
-			const wa=document.getElementById('wa');
+			const notice=document.getElementById('notice');
 			try{
 				if(!ref) throw new Error('Missing order reference');
 				const response=await fetch('/api/checkout/'+encodeURIComponent(ref));
@@ -42,18 +42,18 @@
 				const paid=order.payment_status==='PAID';
 				icon.textContent=paid?'✅':'⚠️';
 				title.textContent=paid?'Payment successful':'Payment not confirmed';
-				body.textContent=paid?'Your payment was received successfully. Your water-can order has been confirmed.':'We could not confirm this payment. Please contact support before trying again.';
+				body.textContent=paid?'Your payment was received successfully. Your water-can order has been confirmed.':'Your payment was not successful. No amount was confirmed. Please try again.';
+				notice.hidden=false;
 				if(paid){
 					document.getElementById('order').textContent=order.id;
 					document.getElementById('amount').textContent='₹'+(order.pricing?.total||0);
 					details.hidden=false;
 				}
-				wa.href='https://wa.me/'+encodeURIComponent(order.phone||'')+'?text='+encodeURIComponent((paid?'Payment complete for order ':'Payment status for order ')+ref);
 			}catch(error){
 				icon.textContent='⚠️';
 				title.textContent='Payment status unavailable';
 				body.textContent='We could not check the payment status. Please contact support with your order reference.';
-				wa.hidden=true;
+				notice.hidden=true;
 			}
 		})();
 	</script>
