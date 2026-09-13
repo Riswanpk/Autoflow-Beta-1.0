@@ -72,19 +72,33 @@ function payuConfigError() {
 
 function verifyPayuResponse(data) {
   if (!data.hash || !process.env.PAYU_SALT) return false;
-  const prefix = data.additionalCharges ? `${data.additionalCharges}|` : '';
+  const additionalCharges = data.additionalCharges || data.additional_charges || '';
   const splitInfo = data.splitInfo || data.splitRequest || '';
-  const splitPart = splitInfo ? `${splitInfo}|` : '';
   const received = String(data.hash).toLowerCase();
   const suffix = `${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
   const inputs = [
-    `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}|||||||||||${suffix}`,
-    `${prefix}${process.env.PAYU_SALT}|${data.status}|${splitPart}||||||${suffix}`
+    `${additionalCharges ? `${additionalCharges}|` : ''}${process.env.PAYU_SALT}|${data.status}|${splitInfo ? `${splitInfo}|` : ''}|||||||||||${suffix}`,
+    `${additionalCharges ? `${additionalCharges}|` : ''}${process.env.PAYU_SALT}|${data.status}|${splitInfo ? `${splitInfo}|` : ''}||||||${suffix}`,
+    `${process.env.PAYU_SALT}|${data.status}||||||${suffix}`,
+    `${process.env.PAYU_SALT}|${data.status}|||||||||||${suffix}`
   ];
   return inputs.some(input => {
     const expected = crypto.createHash('sha512').update(input).digest('hex');
     return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
   });
+}
+
+function payuResponseHashDiagnostics(data) {
+  const additionalCharges = data.additionalCharges || data.additional_charges || '';
+  const splitInfo = data.splitInfo || data.splitRequest || '';
+  const suffix = `${data.udf5 || ''}|${data.udf4 || ''}|${data.udf3 || ''}|${data.udf2 || ''}|${data.udf1 || ''}|${data.email || ''}|${data.firstname || ''}|${data.productinfo || ''}|${data.amount || ''}|${data.txnid || ''}|${data.key || ''}`;
+  const inputs = [
+    `${additionalCharges ? `${additionalCharges}|` : ''}${process.env.PAYU_SALT}|${data.status}|${splitInfo ? `${splitInfo}|` : ''}|||||||||||${suffix}`,
+    `${additionalCharges ? `${additionalCharges}|` : ''}${process.env.PAYU_SALT}|${data.status}|${splitInfo ? `${splitInfo}|` : ''}||||||${suffix}`,
+    `${process.env.PAYU_SALT}|${data.status}||||||${suffix}`,
+    `${process.env.PAYU_SALT}|${data.status}|||||||||||${suffix}`
+  ];
+  return inputs.map(input => crypto.createHash('sha512').update(input).digest('hex').slice(0, 12));
 }
 
 function mockPayuSplit(orderId, payuId) {
@@ -281,7 +295,7 @@ app.post('/payu/success',(req,res)=>{
   if(String(req.body.status).toLowerCase()!=='success') reasons.push('status_not_success');
   if(!verifyPayuResponse(req.body)) reasons.push('hash_mismatch');
   if(reasons.length){
-    console.error('PayU success rejected', JSON.stringify({reasons,txnid:req.body.txnid,status:req.body.status,amount:req.body.amount,udf1:req.body.udf1,keyPresent:Boolean(req.body.key),hashLength:String(req.body.hash||'').length,splitInfoPresent:Boolean(req.body.splitInfo)}));
+    console.error('PayU success rejected', JSON.stringify({reasons,txnid:req.body.txnid,status:req.body.status,amount:req.body.amount,udf1:req.body.udf1,keyPresent:Boolean(req.body.key),hashLength:String(req.body.hash||'').length,hashPrefix:String(req.body.hash||'').slice(0,12),additionalChargesPresent:Boolean(req.body.additionalCharges||req.body.additional_charges),splitInfoPresent:Boolean(req.body.splitInfo),candidatePrefixes:payuResponseHashDiagnostics(req.body)}));
     return res.status(400).send('Invalid PayU payment response');
   }
   db.prepare(`UPDATE orders SET payment_status='PAID',paid_at=CURRENT_TIMESTAMP WHERE id=?`).run(id);
