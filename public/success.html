@@ -1,1 +1,61 @@
-<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Payment status</title><style>body{font-family:Arial;background:#f5f7fb}.card{max-width:440px;margin:80px auto;background:#fff;padding:30px;border-radius:18px;text-align:center;box-shadow:0 4px 20px #0001}a{display:block;margin-top:18px;padding:13px;border-radius:10px;text-decoration:none;background:#1683ff;color:#fff}</style></head><body><div class="card"><div id="icon" style="font-size:60px">…</div><h1 id="title">Checking payment</h1><p id="body">Please wait.</p><a id="wa" href="#">Return to WhatsApp</a></div><script>(async()=>{const ref=new URLSearchParams(location.search).get('ref');const r=await fetch('/api/checkout/'+encodeURIComponent(ref));const o=await r.json();const paid=o.payment_status==='PAID';document.getElementById('icon').textContent=paid?'✅':'⚠️';document.getElementById('title').textContent=paid?'Payment successful':'Payment not confirmed';document.getElementById('body').textContent=paid?'Your water-can order has been received.':'We could not confirm this payment. Please contact support before trying again.';document.getElementById('wa').href='https://wa.me/'+encodeURIComponent(o.phone)+'?text='+encodeURIComponent((paid?'Payment complete':'Payment status')+' for order '+ref);})();</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width">
+	<title>Payment status</title>
+	<style>
+		body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;color:#172033}
+		.card{max-width:440px;margin:80px auto;background:#fff;padding:30px;border-radius:18px;text-align:center;box-shadow:0 4px 20px #0001}
+		.icon{font-size:60px}
+		h1{margin:16px 0 10px}
+		p{line-height:1.5;color:#536078}
+		.details{margin:22px 0;padding:14px;background:#f5f7fb;border-radius:10px}
+		.details div{display:flex;justify-content:space-between;margin:7px 0}
+		a{display:block;margin-top:18px;padding:13px;border-radius:10px;text-decoration:none;background:#1683ff;color:#fff}
+	</style>
+</head>
+<body>
+	<main class="card">
+		<div id="icon" class="icon">...</div>
+		<h1 id="title">Checking payment</h1>
+		<p id="body">Please wait while we confirm your payment.</p>
+		<div id="details" class="details" hidden>
+			<div><span>Order</span><strong id="order"></strong></div>
+			<div><span>Amount paid</span><strong id="amount"></strong></div>
+		</div>
+		<a id="wa" href="#">Return to WhatsApp</a>
+	</main>
+	<script>
+		(async()=>{
+			const ref=new URLSearchParams(location.search).get('ref');
+			const icon=document.getElementById('icon');
+			const title=document.getElementById('title');
+			const body=document.getElementById('body');
+			const details=document.getElementById('details');
+			const wa=document.getElementById('wa');
+			try{
+				if(!ref) throw new Error('Missing order reference');
+				const response=await fetch('/api/checkout/'+encodeURIComponent(ref));
+				if(!response.ok) throw new Error('Order lookup failed');
+				const order=await response.json();
+				const paid=order.payment_status==='PAID';
+				icon.textContent=paid?'✅':'⚠️';
+				title.textContent=paid?'Payment successful':'Payment not confirmed';
+				body.textContent=paid?'Your payment was received successfully. Your water-can order has been confirmed.':'We could not confirm this payment. Please contact support before trying again.';
+				if(paid){
+					document.getElementById('order').textContent=order.id;
+					document.getElementById('amount').textContent='₹'+(order.pricing?.total||0);
+					details.hidden=false;
+				}
+				wa.href='https://wa.me/'+encodeURIComponent(order.phone||'')+'?text='+encodeURIComponent((paid?'Payment complete for order ':'Payment status for order ')+ref);
+			}catch(error){
+				icon.textContent='⚠️';
+				title.textContent='Payment status unavailable';
+				body.textContent='We could not check the payment status. Please contact support with your order reference.';
+				wa.hidden=true;
+			}
+		})();
+	</script>
+</body>
+</html>
