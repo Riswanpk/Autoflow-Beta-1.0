@@ -42,6 +42,95 @@ for (const column of ['gateway_fee', 'gateway_tax', 'processing_fee']) {
   try { db.exec(`ALTER TABLE orders ADD COLUMN ${column} REAL`); } catch (e) { /* already exists */ }
 }
 
+const D1_SYNC_URL = process.env.D1_SYNC_URL?.replace(/\/+$/, '') || '';
+const D1_SYNC_TOKEN = process.env.D1_SYNC_TOKEN || '';
+db.exec(`CREATE TABLE IF NOT EXISTS d1_sync_outbox (
+  order_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 1,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)`);
+db.exec(`CREATE TRIGGER IF NOT EXISTS enqueue_complete_order_insert
+  AFTER INSERT ON orders
+  WHEN NEW.cans IS NOT NULL AND NEW.address IS NOT NULL AND NEW.total_amount IS NOT NULL
+  BEGIN
+    INSERT INTO d1_sync_outbox(order_id) VALUES(NEW.id)
+    ON CONFLICT(order_id) DO UPDATE SET revision=revision+1, attempt_count=0, next_attempt_at=CURRENT_TIMESTAMP;
+  END;
+  CREATE TRIGGER IF NOT EXISTS enqueue_complete_order_update
+  AFTER UPDATE ON orders
+  WHEN NEW.cans IS NOT NULL AND NEW.address IS NOT NULL AND NEW.total_amount IS NOT NULL
+  BEGIN
+    INSERT INTO d1_sync_outbox(order_id) VALUES(NEW.id)
+    ON CONFLICT(order_id) DO UPDATE SET revision=revision+1, attempt_count=0, next_attempt_at=CURRENT_TIMESTAMP;
+  END;`);
+
+let syncingD1 = false;
+async function syncD1Outbox() {
+  if (!D1_SYNC_URL || !D1_SYNC_TOKEN || syncingD1) return;
+  syncingD1 = true;
+  try {
+    const queued = db.prepare(
+      'SELECT order_id, revision, attempt_count FROM d1_sync_outbox WHERE next_attempt_at <= CURRENT_TIMESTAMP ORDER BY next_attempt_at LIMIT 20'
+    ).all();
+    for (const item of queued) {
+      try {
+        const order = db.prepare('SELECT * FROM orders WHERE id=?').get(item.order_id);
+        if (!order || !order.cans || !order.address || order.total_amount === null) {
+          db.prepare('DELETE FROM d1_sync_outbox WHERE order_id=? AND revision=?').run(item.order_id, item.revision);
+          continue;
+        }
+        const rawCreatedAt = String(order.created_at);
+        const isoCreatedAt = /(?:Z|[+-]\d{2}:\d{2})$/i.test(rawCreatedAt)
+          ? rawCreatedAt
+          : `${rawCreatedAt.replace(' ', 'T')}Z`;
+        const response = await fetch(`${D1_SYNC_URL}/api/sync/orders`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Watercan-Sync-Key': D1_SYNC_TOKEN,
+          },
+          body: JSON.stringify({
+            id: order.id,
+            customerName: order.name || 'Customer',
+            phone: order.phone || '',
+            address: order.address,
+            quantity: order.cans,
+            canSize: '20 L',
+            pricePerCan: Math.round((Number(order.base_amount) / order.cans) * 100) / 100,
+            totalAmount: Number(order.total_amount),
+            paymentStatus: order.payment_status,
+            paymentGatewayStatus: order.payment_status,
+            createdAt: new Date(isoCreatedAt).toISOString(),
+          }),
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`D1 returned ${response.status}: ${detail}`);
+        }
+        db.prepare('DELETE FROM d1_sync_outbox WHERE order_id=? AND revision=?').run(item.order_id, item.revision);
+      } catch (error) {
+        const delaySeconds = Math.min(300, 2 ** Math.min(item.attempt_count + 1, 8));
+        db.prepare(
+          "UPDATE d1_sync_outbox SET attempt_count=attempt_count+1, next_attempt_at=datetime('now', ?) WHERE order_id=? AND revision=?"
+        ).run(`+${delaySeconds} seconds`, item.order_id, item.revision);
+        console.error(`D1 sync failed for order ${item.order_id}; retrying in ${delaySeconds}s:`, error.message);
+      }
+    }
+  } catch (error) {
+    console.error('Could not process the D1 sync queue:', error.message);
+  } finally {
+    syncingD1 = false;
+  }
+}
+
+if (D1_SYNC_URL && D1_SYNC_TOKEN) {
+  void syncD1Outbox();
+  setInterval(() => void syncD1Outbox(), 10000);
+} else {
+  console.warn('D1 sync is disabled. Set D1_SYNC_URL and D1_SYNC_TOKEN to sync customer orders.');
+}
+
 const money = n => Math.round(Number(n) * 100) / 100;
 function pricing(cans) {
   const base = money(cans * Number(process.env.CAN_PRICE || 50));
